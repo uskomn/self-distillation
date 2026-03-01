@@ -8,7 +8,6 @@ import numpy as np
 from data.cmrc_loader import get_dataloader
 from models.distill_models import TeacherModel, StudentModel
 from models.distill_loss import (
-    total_distillation_loss,
     qa_focused_attention_loss,
     logits_distillation_loss,
     hard_label_loss
@@ -22,7 +21,6 @@ parser.add_argument("--exp", type=str, default="full",
 args = parser.parse_args()
 
 experiment_type = args.exp
-
 print("当前实验模式:", experiment_type)
 
 BATCH_SIZE = 4
@@ -37,13 +35,18 @@ device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 train_dataset, val_dataset, raw_val_dataset, tokenizer = get_dataloader(
     batch_size=BATCH_SIZE,
-    small_sample=True  # 本地3060可以开完整数据
+    small_sample=True
 )
 
 train_loader = DataLoader(train_dataset, batch_size=BATCH_SIZE, shuffle=True)
 
-teacher = TeacherModel().to(device)
 student = StudentModel().to(device)
+
+if experiment_type in ["kl", "full"]:
+    teacher = TeacherModel().to(device)
+    teacher.eval()
+else:
+    teacher = None
 
 optimizer = AdamW(student.parameters(), lr=LR)
 
@@ -73,12 +76,12 @@ for epoch in range(EPOCHS):
         if token_type_ids is not None:
             token_type_ids = token_type_ids.to(device)
         else:
-            # 如果模型没有 token_type_ids（roberta）
             token_type_ids = torch.zeros_like(input_ids).to(device)
 
-        teacher_outputs = teacher(input_ids, attention_mask)
+
         student_outputs = student(input_ids, attention_mask)
 
+        # Hard label loss（始终有）
         l_hard = hard_label_loss(
             student_outputs["start_logits"],
             student_outputs["end_logits"],
@@ -86,23 +89,50 @@ for epoch in range(EPOCHS):
             end_positions
         )
 
-        l_logits = logits_distillation_loss(
-            student_outputs["start_logits"],
-            student_outputs["end_logits"],
-            teacher_outputs["start_logits"],
-            teacher_outputs["end_logits"],
-            TEMPERATURE
-        )
 
-        l_attn = qa_focused_attention_loss(
-            student_outputs["attentions"],
-            teacher_outputs["attentions"],
-            token_type_ids,
-            start_positions,
-            end_positions
-        )
+        if experiment_type == "student":
+            loss = l_hard
+            l_logits = torch.tensor(0.0)
+            l_attn = torch.tensor(0.0)
 
-        loss = ALPHA * l_hard + BETA * l_logits + GAMMA * l_attn
+        elif experiment_type == "kl":
+
+            with torch.no_grad():
+                teacher_outputs = teacher(input_ids, attention_mask)
+
+            l_logits = logits_distillation_loss(
+                student_outputs["start_logits"],
+                student_outputs["end_logits"],
+                teacher_outputs["start_logits"],
+                teacher_outputs["end_logits"],
+                TEMPERATURE
+            )
+
+            loss = ALPHA * l_hard + BETA * l_logits
+            l_attn = torch.tensor(0.0)
+
+        elif experiment_type == "full":
+
+            with torch.no_grad():
+                teacher_outputs = teacher(input_ids, attention_mask)
+
+            l_logits = logits_distillation_loss(
+                student_outputs["start_logits"],
+                student_outputs["end_logits"],
+                teacher_outputs["start_logits"],
+                teacher_outputs["end_logits"],
+                TEMPERATURE
+            )
+
+            l_attn = qa_focused_attention_loss(
+                student_outputs["attentions"],
+                teacher_outputs["attentions"],
+                token_type_ids,
+                start_positions,
+                end_positions
+            )
+
+            loss = ALPHA * l_hard + BETA * l_logits + GAMMA * l_attn
 
         # =====================
         # 反向传播
@@ -129,6 +159,7 @@ for epoch in range(EPOCHS):
 
     with torch.no_grad():
         for i in tqdm(range(0, len(val_dataset), BATCH_SIZE), desc="Validation"):
+
             batch = val_dataset[i: i + BATCH_SIZE]
 
             input_ids = batch["input_ids"].to(device)
@@ -143,14 +174,18 @@ for epoch in range(EPOCHS):
     all_end_logits = np.concatenate(all_end_logits)
 
     predictions = postprocess_qa_predictions(
-        raw_val_dataset,  # 原始example
-        val_dataset,  # feature级数据
+        raw_val_dataset,
+        val_dataset,
         (all_start_logits, all_end_logits),
         tokenizer
     )
 
-
     metrics = compute_metrics(predictions, raw_val_dataset)
 
-torch.save(student.state_dict(), "student_distilled.pt")
-print("模型已保存")
+    print("Validation EM:", metrics["exact_match"])
+    print("Validation F1:", metrics["f1"])
+
+
+save_path = f"student_{experiment_type}.pt"
+torch.save(student.state_dict(), save_path)
+print("模型已保存:", save_path)
