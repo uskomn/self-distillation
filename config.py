@@ -2,9 +2,9 @@
 # 所有超参数和路径统一管理
 
 # ====== 模型 ======
-TEACHER_NAME = "hfl/chinese-roberta-wwm-ext"
-TEACHER_SAVE_PATH = "./checkpoints/teacher_cmrc2018"
-STUDENT_SAVE_PATH = "./checkpoints/student_distilled"
+TEACHER_NAME = "/root/autodl-tmp/pretrained/chinese-roberta"
+TEACHER_SAVE_PATH = "/root/autodl-tmp/checkpoints/teacher_cmrc2018"
+STUDENT_SAVE_PATH = "/root/autodl-tmp/checkpoints/student_distilled"
 
 # ====== 数据 ======
 MAX_LENGTH = 512

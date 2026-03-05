@@ -1,11 +1,12 @@
 import collections
 from datasets import load_dataset
 from transformers import AutoTokenizer
+from datasets import load_from_disk
+import os
 
-MODEL_NAME = "bert-base-chinese"
+MODEL_NAME = "hfl/chinese-roberta-wwm-ext"
 MAX_LENGTH = 384
 DOC_STRIDE = 128
-
 
 def load_cmrc_dataset():
     return load_dataset("cmrc2018")
