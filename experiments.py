@@ -542,7 +542,7 @@ def run_evaluation(exp_list=None):
         return
 
     # 保存 JSON
-    os.makedirs("./results", exist_ok=True)
+    os.makedirs("/root/auto-tmp/results", exist_ok=True)
     with open(RESULTS_FILE, "w", encoding="utf-8") as f:
         json.dump(all_results, f, ensure_ascii=False, indent=2)
     print(f"\n结果已保存至：{RESULTS_FILE}")

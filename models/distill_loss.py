@@ -45,11 +45,6 @@ def qa_focused_attention_loss(
         start_positions,
         end_positions
 ):
-    """
-    QA Focused Attention Distillation：
-    对 question 区域和 answer 区域的 attention 施加更高权重
-    其余区域也参与蒸馏（权重为1），避免梯度稀疏
-    """
     mse = nn.MSELoss()
     total_loss = 0.0
 
@@ -82,7 +77,7 @@ def qa_focused_attention_loss(
 
         weight = weight_matrix.unsqueeze(1)        # (B, 1, L, L) 广播到 head 维度
 
-        # ✅ sqrt 归一化，缓解 attention 分布偏斜（TinyBERT 做法）
+        # sqrt 归一化，缓解 attention 分布偏斜（TinyBERT 做法）
         s_attn_norm = torch.sqrt(s_attn + 1e-6)
         t_attn_norm = torch.sqrt(t_attn.detach() + 1e-6)
 
