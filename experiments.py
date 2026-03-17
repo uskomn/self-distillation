@@ -37,10 +37,12 @@ from config import (
     STUDENT_EPOCHS, STUDENT_BATCH_SIZE, STUDENT_LR,
     STUDENT_WARMUP_RATIO, STUDENT_WEIGHT_DECAY,
     STUDENT_NUM_LAYERS, TEACHER_LAYERS_FOR_DISTILL,
+    PRETRAIN_STUDENT_SAVE_PATH,
     ALPHA, BETA, GAMMA, TEMPERATURE,
 )
 from models.distill_loss import hard_label_loss, logits_distillation_loss, qa_focused_attention_loss
 from utils.evaluate import evaluate_model
+from utils.pretrain_distill import run_pretrain_distill
 
 
 # ============================================================
@@ -52,6 +54,7 @@ EXPERIMENT_PATHS = {
     "B": "/root/autodl-tmp/checkpoints/exp_B_hard_only",
     "C": "/root/autodl-tmp/checkpoints/exp_C_logits_kd",
     "D": "/root/autodl-tmp/checkpoints/exp_D_logits_attn_kd",
+    "E": "/root/autodl-tmp/checkpoints/exp_E_two_stage_distill",  # 两阶段蒸馏
 }
 
 RESULTS_FILE = "/root/autodl-tmp/results/all_experiments.json"
@@ -116,11 +119,8 @@ def preprocess_train(examples, tokenizer):
     return tokenized
 
 
-def get_dataloaders(tokenizer, batch_size,debug=False):
+def get_dataloaders(tokenizer, batch_size):
     dataset = load_from_disk("/root/autodl-tmp/cmrc2018")
-    if debug:
-        dataset["train"] = dataset["train"].select(range(200))
-        dataset["validation"] = dataset["validation"].select(range(50))
 
     train_dataset = dataset["train"].map(
         lambda x: preprocess_train(x, tokenizer),
@@ -169,32 +169,21 @@ def save_best(model, tokenizer, save_path, val_loss, best_val_loss, epoch):
         os.makedirs(save_path, exist_ok=True)
         model.save_pretrained(save_path)
         tokenizer.save_pretrained(save_path)
-        print(f" Epoch {epoch+1} 保存最优模型，Val Loss: {val_loss:.4f}")
+        print(f"  Epoch {epoch+1} 保存最优模型，Val Loss: {val_loss:.4f}")
         return val_loss
     return best_val_loss
 
 
-def build_student_model_from_teacher(device):
-    """构建学生模型并从微调教师权重初始化"""
-    config = BertConfig.from_pretrained(TEACHER_NAME)
-    config.num_hidden_layers = STUDENT_NUM_LAYERS
-    config.output_attentions = True
-    config.output_hidden_states = True
-
-    student = BertForQuestionAnswering(config)
-
-    teacher_ckpt = AutoModelForQuestionAnswering.from_pretrained(TEACHER_SAVE_PATH)
-    student.bert.embeddings.load_state_dict(teacher_ckpt.bert.embeddings.state_dict())
-    for s_idx, t_idx in enumerate(TEACHER_LAYERS_FOR_DISTILL):
-        student.bert.encoder.layer[s_idx].load_state_dict(
-            teacher_ckpt.bert.encoder.layer[t_idx].state_dict()
-        )
-    student.qa_outputs.load_state_dict(teacher_ckpt.qa_outputs.state_dict())
-    del teacher_ckpt
-    torch.cuda.empty_cache()
-    print("学生模型权重初始化完成（来自微调教师）")
-
-    return student.to(device)
+def build_student_model_from_teacher(device, init_mode="finetune_teacher"):
+    """
+    构建学生 BertForQuestionAnswering
+    init_mode:
+      "finetune_teacher"  : 从微调教师偶数层初始化（B/C/D 组）
+      "pretrain_distill"  : 从预训练蒸馏权重初始化（E 组）
+    """
+    from models.distill_models import StudentModel
+    wrapper = StudentModel(init_mode=init_mode)
+    return wrapper.model.to(device)
 
 
 def load_finetuned_teacher(device):
@@ -219,7 +208,7 @@ def run_experiment_A():
 
     device = get_device()
     tokenizer = AutoTokenizer.from_pretrained(TEACHER_NAME)
-    train_loader, val_loader = get_dataloaders(tokenizer, TEACHER_BATCH_SIZE,debug=False)
+    train_loader, val_loader = get_dataloaders(tokenizer, TEACHER_BATCH_SIZE)
 
     model = AutoModelForQuestionAnswering.from_pretrained(TEACHER_NAME).to(device)
     optimizer, scheduler = make_optimizer_scheduler(
@@ -281,7 +270,7 @@ def run_experiment_B():
 
     device = get_device()
     tokenizer = AutoTokenizer.from_pretrained(TEACHER_SAVE_PATH)
-    train_loader, val_loader = get_dataloaders(tokenizer, STUDENT_BATCH_SIZE,debug=False)
+    train_loader, val_loader = get_dataloaders(tokenizer, STUDENT_BATCH_SIZE)
 
     student = build_student_model_from_teacher(device)
     optimizer, scheduler = make_optimizer_scheduler(
@@ -340,7 +329,7 @@ def run_experiment_C():
 
     device = get_device()
     tokenizer = AutoTokenizer.from_pretrained(TEACHER_SAVE_PATH)
-    train_loader, val_loader = get_dataloaders(tokenizer, STUDENT_BATCH_SIZE,debug=False)
+    train_loader, val_loader = get_dataloaders(tokenizer, STUDENT_BATCH_SIZE)
 
     teacher = load_finetuned_teacher(device)
     student = build_student_model_from_teacher(device)
@@ -409,7 +398,7 @@ def run_experiment_D():
 
     device = get_device()
     tokenizer = AutoTokenizer.from_pretrained(TEACHER_SAVE_PATH)
-    train_loader, val_loader = get_dataloaders(tokenizer, STUDENT_BATCH_SIZE,debug=False)
+    train_loader, val_loader = get_dataloaders(tokenizer, STUDENT_BATCH_SIZE)
 
     teacher = load_finetuned_teacher(device)
     student = build_student_model_from_teacher(device)
@@ -523,6 +512,7 @@ def run_evaluation(exp_list=None):
         "B": "B组-HardLabel蒸馏",
         "C": "C组-Logits蒸馏",
         "D": "D组-Logits+Attention蒸馏",
+        "E": "E组-两阶段蒸馏(预训练+微调)",
     }
 
     for exp_id in exp_list:
@@ -542,7 +532,7 @@ def run_evaluation(exp_list=None):
         return
 
     # 保存 JSON
-    os.makedirs("/root/auto-tmp/results", exist_ok=True)
+    os.makedirs("./results", exist_ok=True)
     with open(RESULTS_FILE, "w", encoding="utf-8") as f:
         json.dump(all_results, f, ensure_ascii=False, indent=2)
     print(f"\n结果已保存至：{RESULTS_FILE}")
@@ -606,17 +596,123 @@ def print_comparison_table(results):
 # 主入口
 # ============================================================
 
+def run_experiment_E():
+    """
+    E组：两阶段蒸馏
+      第一阶段：预训练蒸馏（Wikipedia语料，MLM + 隐层 + Attention）
+      第二阶段：微调蒸馏（CMRC2018，Hard Label + Logits + QA-Attention）
+    学生初始化来自第一阶段产出，而非直接从微调教师偶数层拷贝
+    """
+    print("\n" + "="*60)
+    print("E组：两阶段蒸馏（预训练蒸馏 -> 微调蒸馏）")
+    print("="*60)
+
+    # ---- 第一阶段：预训练蒸馏 ----
+    if os.path.exists(PRETRAIN_STUDENT_SAVE_PATH):
+        print(f"检测到预训练蒸馏权重已存在：{PRETRAIN_STUDENT_SAVE_PATH}，跳过第一阶段")
+    else:
+        print("\n>>> 第一阶段：预训练蒸馏")
+        run_pretrain_distill()
+
+    # ---- 第二阶段：微调蒸馏（与 D 组相同损失，但学生初始化不同）----
+    print("\n>>> 第二阶段：微调阶段蒸馏（Logits + QA-Attention）")
+
+    device = get_device()
+    tokenizer = AutoTokenizer.from_pretrained(TEACHER_SAVE_PATH)
+    train_loader, val_loader = get_dataloaders(tokenizer, STUDENT_BATCH_SIZE)
+
+    teacher = load_finetuned_teacher(device)
+
+    # ✅ 关键区别：从预训练蒸馏权重初始化，而非直接从微调教师偶数层
+    student = build_student_model_from_teacher(device, init_mode="pretrain_distill")
+
+    optimizer, scheduler = make_optimizer_scheduler(
+        student, train_loader, STUDENT_LR, STUDENT_WARMUP_RATIO, STUDENT_WEIGHT_DECAY, STUDENT_EPOCHS
+    )
+
+    save_path = EXPERIMENT_PATHS["E"]
+    best_val_loss = float("inf")
+
+    for epoch in range(STUDENT_EPOCHS):
+        student.train()
+        total_sum = hard_sum = logit_sum = attn_sum = 0.0
+
+        pbar = tqdm(train_loader, desc=f"[E组 Epoch {epoch+1}/{STUDENT_EPOCHS}] 微调蒸馏")
+        for batch in pbar:
+            input_ids      = batch["input_ids"].to(device)
+            attention_mask = batch["attention_mask"].to(device)
+            token_type_ids = batch["token_type_ids"].to(device)
+            start_pos      = batch["start_positions"].to(device)
+            end_pos        = batch["end_positions"].to(device)
+
+            with torch.no_grad():
+                t_out = teacher(input_ids=input_ids, attention_mask=attention_mask,
+                                token_type_ids=token_type_ids)
+
+            s_out = student(input_ids=input_ids, attention_mask=attention_mask,
+                            token_type_ids=token_type_ids)
+
+            l_hard = hard_label_loss(s_out.start_logits, s_out.end_logits, start_pos, end_pos)
+            l_kd   = logits_distillation_loss(
+                s_out.start_logits, s_out.end_logits,
+                t_out["start_logits"], t_out["end_logits"],
+                TEMPERATURE
+            )
+            l_attn = qa_focused_attention_loss(
+                s_out.attentions, t_out["attentions"],
+                input_ids, token_type_ids, start_pos, end_pos
+            )
+            loss = ALPHA * l_hard + BETA * l_kd + GAMMA * l_attn
+
+            loss.backward()
+            nn.utils.clip_grad_norm_(student.parameters(), 1.0)
+            optimizer.step(); scheduler.step(); optimizer.zero_grad()
+
+            total_sum += loss.item(); hard_sum += l_hard.item()
+            logit_sum += l_kd.item(); attn_sum += l_attn.item()
+            pbar.set_postfix(
+                total=f"{loss.item():.4f}", hard=f"{l_hard.item():.4f}",
+                kd=f"{l_kd.item():.4f}", attn=f"{l_attn.item():.4f}",
+            )
+
+        n = len(train_loader)
+        print(
+            f"E组 Epoch {epoch+1} | Total:{total_sum/n:.4f} | "
+            f"Hard:{hard_sum/n:.4f} | KD:{logit_sum/n:.4f} | Attn:{attn_sum/n:.4f}"
+        )
+
+        student.eval()
+        val_loss = 0.0
+        with torch.no_grad():
+            for batch in val_loader:
+                s_out = student(
+                    input_ids=batch["input_ids"].to(device),
+                    attention_mask=batch["attention_mask"].to(device),
+                    token_type_ids=batch["token_type_ids"].to(device),
+                )
+                val_loss += hard_label_loss(
+                    s_out.start_logits, s_out.end_logits,
+                    batch["start_positions"].to(device),
+                    batch["end_positions"].to(device),
+                ).item()
+
+        avg_val = val_loss / len(val_loader)
+        print(f"E组 Epoch {epoch+1} Val Loss: {avg_val:.4f}")
+        best_val_loss = save_best(student, tokenizer, save_path, avg_val, best_val_loss, epoch)
+
+
 EXPERIMENT_RUNNERS = {
     "A": run_experiment_A,
     "B": run_experiment_B,
     "C": run_experiment_C,
     "D": run_experiment_D,
+    "E": run_experiment_E,
 }
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--exp", type=str, default="all",
-                        help="要运行的实验组：all / A / B / C / D / A,B,C 等")
+                        help="要运行的实验组：all / A / B / C / D / E / A,B,C 等")
     parser.add_argument("--report_only", action="store_true",
                         help="只汇总已有结果，不重新训练")
     args = parser.parse_args()
@@ -625,7 +721,7 @@ if __name__ == "__main__":
         run_evaluation()
     else:
         if args.exp == "all":
-            exp_list = ["A", "B", "C", "D"]
+            exp_list = ["A", "B", "C", "D", "E"]
         else:
             exp_list = [e.strip().upper() for e in args.exp.split(",")]
 
@@ -633,12 +729,10 @@ if __name__ == "__main__":
             if exp_id not in EXPERIMENT_RUNNERS:
                 print(f"未知实验组：{exp_id}，跳过")
                 continue
-            # B/C/D 依赖教师 checkpoint
-            if exp_id in ("B", "C", "D") and not os.path.exists(TEACHER_SAVE_PATH):
-                print(f"[警告] 未找到教师 checkpoint，请先运行 A 组！")
+            # B/C/D/E 依赖教师 checkpoint
+            if exp_id in ("B", "C", "D", "E") and not os.path.exists(TEACHER_SAVE_PATH):
+                print(f"[警告] 未找到微调教师 checkpoint，请先运行 A 组！")
                 break
             EXPERIMENT_RUNNERS[exp_id]()
 
-        # 训练完成后自动评估
         run_evaluation(exp_list)
-    os.system("/usr/bin/shutdown")

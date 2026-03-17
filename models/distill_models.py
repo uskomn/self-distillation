@@ -2,13 +2,16 @@ import torch
 import torch.nn as nn
 from transformers import (
     AutoConfig,
+    AutoModel,
     AutoModelForQuestionAnswering,
     BertConfig,
+    BertForMaskedLM,
     BertForQuestionAnswering,
 )
 from config import (
     TEACHER_NAME,
     TEACHER_SAVE_PATH,
+    PRETRAIN_STUDENT_SAVE_PATH,
     STUDENT_NUM_LAYERS,
     TEACHER_LAYERS_FOR_DISTILL,
 )
@@ -60,12 +63,18 @@ class TeacherModel(nn.Module):
 
 class StudentModel(nn.Module):
     """
-    学生模型：6层 BERT
-    从微调好的教师 checkpoint 的偶数层初始化，加速收敛
+    学生模型：6层 BertForQuestionAnswering
+
+    init_mode 控制初始化策略：
+      "pretrain_distill" : 从第一阶段预训练蒸馏权重初始化（两阶段蒸馏推荐）
+      "finetune_teacher" : 从微调教师偶数层初始化（单阶段蒸馏）
+      "scratch"          : 随机初始化
     """
 
-    def __init__(self, init_from_teacher: bool = True):
+    def __init__(self, init_mode: str = "pretrain_distill"):
         super().__init__()
+        assert init_mode in ("pretrain_distill", "finetune_teacher", "scratch"), \
+            f"init_mode 必须是 pretrain_distill / finetune_teacher / scratch，当前：{init_mode}"
 
         config = BertConfig.from_pretrained(TEACHER_NAME)
         config.num_hidden_layers = STUDENT_NUM_LAYERS
@@ -74,33 +83,47 @@ class StudentModel(nn.Module):
 
         self.model = BertForQuestionAnswering(config)
 
-        if init_from_teacher:
-            self._init_from_teacher()
+        if init_mode == "pretrain_distill":
+            self._init_from_pretrain_distill()
+        elif init_mode == "finetune_teacher":
+            self._init_from_finetune_teacher()
+        # scratch：保持随机初始化
 
-    def _init_from_teacher(self):
-        print(f"从微调教师权重初始化学生模型：{TEACHER_SAVE_PATH}")
+    def _init_from_pretrain_distill(self):
+        """
+        两阶段蒸馏：从第一阶段预训练蒸馏好的 BertForMaskedLM 权重中取 bert 子模块
+        QA head 随机初始化（预训练阶段没有 QA head）
+        """
+        print(f"[StudentModel] 从预训练蒸馏权重初始化：{PRETRAIN_STUDENT_SAVE_PATH}")
+        # 预训练蒸馏保存的是 BertForMaskedLM
+        pretrained_mlm = BertForMaskedLM.from_pretrained(PRETRAIN_STUDENT_SAVE_PATH)
+        self.model.bert.load_state_dict(pretrained_mlm.bert.state_dict())
+        del pretrained_mlm
+        torch.cuda.empty_cache()
+        print("  ✅ bert encoder/embedding 权重加载完成，QA head 随机初始化")
+
+    def _init_from_finetune_teacher(self):
+        """
+        单阶段蒸馏：从微调教师的偶数层 + QA head 初始化
+        """
+        print(f"[StudentModel] 从微调教师权重初始化：{TEACHER_SAVE_PATH}")
         teacher = AutoModelForQuestionAnswering.from_pretrained(TEACHER_SAVE_PATH)
 
-        # 复制 embedding 层
         self.model.bert.embeddings.load_state_dict(
             teacher.bert.embeddings.state_dict()
         )
-
-        # 复制 encoder 层：取教师偶数层 [0,2,4,6,8,10] -> 学生 [0,1,2,3,4,5]
-        # ✅ 与蒸馏损失中的层对齐策略保持一致
         for student_idx, teacher_idx in enumerate(TEACHER_LAYERS_FOR_DISTILL):
             self.model.bert.encoder.layer[student_idx].load_state_dict(
                 teacher.bert.encoder.layer[teacher_idx].state_dict()
             )
-
-        # 复制 QA head（教师已面向任务微调过）
-        self.model.qa_outputs.load_state_dict(
-            teacher.qa_outputs.state_dict()
-        )
-
+        self.model.qa_outputs.load_state_dict(teacher.qa_outputs.state_dict())
         del teacher
         torch.cuda.empty_cache()
-        print("学生模型权重初始化完成！")
+        print("  ✅ encoder + QA head 权重加载完成")
+
+    # 保留旧接口兼容性
+    def _init_from_teacher(self):
+        self._init_from_finetune_teacher()
 
     def forward(self, input_ids, attention_mask, token_type_ids=None):
         outputs = self.model(
