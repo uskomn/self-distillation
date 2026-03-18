@@ -120,6 +120,8 @@ class PretrainStudent(nn.Module):
             attention_mask=attention_mask,
             token_type_ids=token_type_ids,
             labels=labels,
+            output_hidden_states=True,
+            output_attentions=True,
         )
 
 
@@ -138,20 +140,32 @@ def pretrain_distill_loss(
     mse = nn.MSELoss()
 
     l_mlm = student_outputs.loss
+    if l_mlm is None:
+        raise ValueError("student_outputs.loss 为 None，请确认传入了 labels")
 
-    l_hidden = 0.0
+    if student_outputs.hidden_states is None:
+        raise ValueError(
+            "hidden_states 为 None，请确认 forward 中传入了 output_hidden_states=True"
+        )
+    if student_outputs.attentions is None:
+        raise ValueError(
+            "attentions 为 None，请确认 forward 中传入了 output_attentions=True"
+        )
+
+    #  用 torch.tensor 初始化，保证类型一致，避免 float 与 None 运算
+    l_hidden = torch.tensor(0.0, device=l_mlm.device)
     for student_idx, teacher_idx in enumerate(TEACHER_LAYERS_FOR_DISTILL):
         s_h = student_outputs.hidden_states[student_idx + 1]
         t_h = teacher_hidden_states[teacher_idx + 1].detach()
-        l_hidden += mse(F.normalize(s_h, dim=-1), F.normalize(t_h, dim=-1))
-    l_hidden /= len(TEACHER_LAYERS_FOR_DISTILL)
+        l_hidden = l_hidden + mse(F.normalize(s_h, dim=-1), F.normalize(t_h, dim=-1))
+    l_hidden = l_hidden / len(TEACHER_LAYERS_FOR_DISTILL)
 
-    l_attn = 0.0
+    l_attn = torch.tensor(0.0, device=l_mlm.device)
     for student_idx, teacher_idx in enumerate(TEACHER_LAYERS_FOR_DISTILL):
         s_a = student_outputs.attentions[student_idx]
         t_a = teacher_attentions[teacher_idx].detach()
-        l_attn += mse(torch.sqrt(s_a + 1e-6), torch.sqrt(t_a + 1e-6))
-    l_attn /= len(TEACHER_LAYERS_FOR_DISTILL)
+        l_attn = l_attn + mse(torch.sqrt(s_a + 1e-6), torch.sqrt(t_a + 1e-6))
+    l_attn = l_attn / len(TEACHER_LAYERS_FOR_DISTILL)
 
     total = lambda_mlm * l_mlm + lambda_hidden * l_hidden + lambda_attn * l_attn
     return total, l_mlm, l_hidden, l_attn
@@ -287,10 +301,15 @@ def _load_raw_dataset():
         )
 
 
-def get_pretrain_dataloader(tokenizer):
+def get_pretrain_dataloader(tokenizer, debug_samples=None):
     print(f"数据源：{PRETRAIN_DATA_SOURCE}，上限：{PRETRAIN_MAX_SAMPLES} 条")
     dataset = _load_raw_dataset()
     print(f"原始数据 {len(dataset)} 条")
+
+    # 加这一段
+    if debug_samples is not None:
+        dataset = dataset.select(range(debug_samples))
+        print(f"Debug模式：只使用 {len(dataset)} 条数据")
 
     def tokenize_fn(examples):
         texts = [t if (t and t.strip()) else "空" for t in examples["text"]]
@@ -309,7 +328,14 @@ def get_pretrain_dataloader(tokenizer):
         mlm=True,
         mlm_probability=PRETRAIN_MLM_PROB,
     )
-    loader = DataLoader(tokenized, batch_size=PRETRAIN_BATCH_SIZE, shuffle=True, collate_fn=collator)
+
+    loader = DataLoader(
+        tokenized,
+        batch_size=PRETRAIN_BATCH_SIZE,
+        shuffle=True,
+        collate_fn=collator
+    )
+
     print(f"数据就绪：{len(tokenized)} 条，{len(loader)} 个 batch")
     return loader
 
@@ -356,8 +382,17 @@ def run_pretrain_distill():
             if token_type_ids is not None:
                 token_type_ids = token_type_ids.to(device)
 
-            t_hidden, t_attn = teacher(input_ids, attention_mask, token_type_ids)
-            s_out = student(input_ids, attention_mask, token_type_ids, labels)
+            t_hidden, t_attn = teacher(
+                input_ids=input_ids,
+                attention_mask=attention_mask,
+                token_type_ids=token_type_ids,
+            )
+            s_out = student(
+                input_ids=input_ids,
+                attention_mask=attention_mask,
+                token_type_ids=token_type_ids,  # 可以是 None，没关系
+                labels=labels,  # 关键字传入，不会错位
+            )
 
             loss, l_mlm, l_hidden, l_attn = pretrain_distill_loss(s_out, t_hidden, t_attn)
 
@@ -389,7 +424,7 @@ def run_pretrain_distill():
             os.makedirs(PRETRAIN_STUDENT_SAVE_PATH, exist_ok=True)
             student.save_pretrained(PRETRAIN_STUDENT_SAVE_PATH)
             tokenizer.save_pretrained(PRETRAIN_STUDENT_SAVE_PATH)
-            print(f"  ✅ 保存最优权重 -> {PRETRAIN_STUDENT_SAVE_PATH}")
+            print(f"保存最优权重 -> {PRETRAIN_STUDENT_SAVE_PATH}")
 
     print(f"\n预训练蒸馏完成，最优 Loss: {best_loss:.4f}")
 

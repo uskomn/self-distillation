@@ -60,10 +60,7 @@ EXPERIMENT_PATHS = {
 RESULTS_FILE = "/root/autodl-tmp/results/all_experiments.json"
 
 
-# ============================================================
 # 数据预处理（训练集）
-# ============================================================
-
 def preprocess_train(examples, tokenizer):
     questions = [q.strip() for q in examples["question"]]
     contexts = examples["context"]
@@ -502,7 +499,7 @@ def run_experiment_D():
 def run_evaluation(exp_list=None):
     """对所有已完成的实验 checkpoint 进行评估并输出对比报告"""
     if exp_list is None:
-        exp_list = ["A", "B", "C", "D"]
+        exp_list = ["A", "B", "C", "D","E"]
 
     all_results = []
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -711,6 +708,7 @@ EXPERIMENT_RUNNERS = {
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
+    parser.add_argument("--auto_shutdown", action="store_true", help="训练结束自动关机")
     parser.add_argument("--exp", type=str, default="all",
                         help="要运行的实验组：all / A / B / C / D / E / A,B,C 等")
     parser.add_argument("--report_only", action="store_true",
@@ -719,6 +717,8 @@ if __name__ == "__main__":
 
     if args.report_only:
         run_evaluation()
+    elif args.auto_shutdown:
+        pass
     else:
         if args.exp == "all":
             exp_list = ["A", "B", "C", "D", "E"]
@@ -736,3 +736,4 @@ if __name__ == "__main__":
             EXPERIMENT_RUNNERS[exp_id]()
 
         run_evaluation(exp_list)
+    os.system("/usr/bin/shutdown")

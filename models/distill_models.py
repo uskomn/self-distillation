@@ -26,7 +26,7 @@ class TeacherModel(nn.Module):
     def __init__(self, load_finetuned: bool = False):
         super().__init__()
 
-        # ✅ 通过 config 正确开启 attentions/hidden_states 输出
+        # 通过 config 正确开启 attentions/hidden_states 输出
         config = AutoConfig.from_pretrained(TEACHER_NAME)
         config.output_attentions = True
         config.output_hidden_states = True

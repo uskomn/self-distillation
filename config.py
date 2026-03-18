@@ -45,6 +45,9 @@ PRETRAIN_STUDENT_SAVE_PATH = "/root/autodl-tmp/checkpoints/student_pretrain_dist
 #   "cc100"      : cc100 中文子集
 PRETRAIN_DATA_SOURCE = "local_xml"
 
+FREEZE_BOTTOM_LAYERS = 3   # 冻结前3层（6层里冻一半）
+FREEZE_EMBEDDINGS    = True
+
 # ====== 本地 XML 数据集路径（修改为你的实际路径）======
 PRETRAIN_LOCAL_XML_PATH = "/root/autodl-tmp/data/zhwiki-20251220-pages-articles-multistream.xml.bz2"
 # 解析后的纯文本缓存目录（首次运行会生成，之后直接复用）
@@ -60,7 +63,7 @@ PRETRAIN_CC100_CONFIG = "zh-Hans"
 
 PRETRAIN_MAX_SAMPLES = 500000       # 取前 50万条，可按显存/时间调整
 PRETRAIN_EPOCHS = 3
-PRETRAIN_BATCH_SIZE = 32
+PRETRAIN_BATCH_SIZE = 16
 PRETRAIN_LR = 1e-4
 PRETRAIN_WARMUP_RATIO = 0.1
 PRETRAIN_WEIGHT_DECAY = 0.01
