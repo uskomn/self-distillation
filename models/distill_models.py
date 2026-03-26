@@ -18,11 +18,6 @@ from config import (
 
 
 class TeacherModel(nn.Module):
-    """
-    教师模型：hfl/chinese-roberta-wwm-ext
-    使用时应加载已在 CMRC2018 上微调好的 checkpoint
-    """
-
     def __init__(self, load_finetuned: bool = False):
         super().__init__()
 
@@ -32,7 +27,7 @@ class TeacherModel(nn.Module):
         config.output_hidden_states = True
 
         if load_finetuned:
-            # 蒸馏阶段：加载微调好的教师 checkpoint
+            # 蒸馏阶段：加载微调好的
             print(f"加载微调后的教师模型：{TEACHER_SAVE_PATH}")
             self.model = AutoModelForQuestionAnswering.from_pretrained(
                 TEACHER_SAVE_PATH,
@@ -62,15 +57,6 @@ class TeacherModel(nn.Module):
 
 
 class StudentModel(nn.Module):
-    """
-    学生模型：6层 BertForQuestionAnswering
-
-    init_mode 控制初始化策略：
-      "pretrain_distill" : 从第一阶段预训练蒸馏权重初始化（两阶段蒸馏推荐）
-      "finetune_teacher" : 从微调教师偶数层初始化（单阶段蒸馏）
-      "scratch"          : 随机初始化
-    """
-
     def __init__(self, init_mode: str = "pretrain_distill"):
         super().__init__()
         assert init_mode in ("pretrain_distill", "finetune_teacher", "scratch"), \
@@ -87,7 +73,6 @@ class StudentModel(nn.Module):
             self._init_from_pretrain_distill()
         elif init_mode == "finetune_teacher":
             self._init_from_finetune_teacher()
-        # scratch：保持随机初始化
 
     def _init_from_pretrain_distill(self):
         """
@@ -95,12 +80,11 @@ class StudentModel(nn.Module):
         QA head 随机初始化（预训练阶段没有 QA head）
         """
         print(f"[StudentModel] 从预训练蒸馏权重初始化：{PRETRAIN_STUDENT_SAVE_PATH}")
-        # 预训练蒸馏保存的是 BertForMaskedLM
         pretrained_mlm = BertForMaskedLM.from_pretrained(PRETRAIN_STUDENT_SAVE_PATH)
         self.model.bert.load_state_dict(pretrained_mlm.bert.state_dict())
         del pretrained_mlm
         torch.cuda.empty_cache()
-        print("  ✅ bert encoder/embedding 权重加载完成，QA head 随机初始化")
+        print("bert encoder/embedding 权重加载完成，QA head 随机初始化")
 
     def _init_from_finetune_teacher(self):
         """
@@ -119,9 +103,8 @@ class StudentModel(nn.Module):
         self.model.qa_outputs.load_state_dict(teacher.qa_outputs.state_dict())
         del teacher
         torch.cuda.empty_cache()
-        print("  ✅ encoder + QA head 权重加载完成")
+        print("   encoder + QA head 权重加载完成")
 
-    # 保留旧接口兼容性
     def _init_from_teacher(self):
         self._init_from_finetune_teacher()
 

@@ -1,7 +1,7 @@
 # config.py
 # 所有超参数和路径统一管理
 
-# ====== 模型 ======
+# 模型
 TEACHER_NAME = "/root/autodl-tmp/pretrained/chinese-roberta"
 TEACHER_SAVE_PATH = "/root/autodl-tmp/checkpoints/teacher_cmrc2018"
 STUDENT_SAVE_PATH = "/root/autodl-tmp/checkpoints/student_distilled"

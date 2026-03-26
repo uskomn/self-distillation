@@ -38,6 +38,7 @@ from config import (
     STUDENT_WARMUP_RATIO, STUDENT_WEIGHT_DECAY,
     STUDENT_NUM_LAYERS, TEACHER_LAYERS_FOR_DISTILL,
     PRETRAIN_STUDENT_SAVE_PATH,
+    FREEZE_BOTTOM_LAYERS, FREEZE_EMBEDDINGS,
     ALPHA, BETA, GAMMA, TEMPERATURE,
 )
 from models.distill_loss import hard_label_loss, logits_distillation_loss, qa_focused_attention_loss
@@ -45,22 +46,81 @@ from utils.evaluate import evaluate_model
 from utils.pretrain_distill import run_pretrain_distill
 
 
-# ============================================================
-# 路径配置
-# ============================================================
-
+# 存放位置
 EXPERIMENT_PATHS = {
     "A": "/root/autodl-tmp/checkpoints/exp_A_teacher",
     "B": "/root/autodl-tmp/checkpoints/exp_B_hard_only",
     "C": "/root/autodl-tmp/checkpoints/exp_C_logits_kd",
     "D": "/root/autodl-tmp/checkpoints/exp_D_logits_attn_kd",
-    "E": "/root/autodl-tmp/checkpoints/exp_E_two_stage_distill",  # 两阶段蒸馏
+    "E": "/root/autodl-tmp/checkpoints/exp_E_two_stage_distill",
 }
 
 RESULTS_FILE = "/root/autodl-tmp/results/all_experiments.json"
 
 
+# E组冻结工具函数
+def freeze_bottom_layers(model, freeze_embeddings=True, freeze_layers=3):
+    """
+    冻结学生模型底层，保留预训练蒸馏习得的表征。
+    只让上层 encoder 和 QA head 参与微调。
+
+    freeze_embeddings : 是否冻结 embedding 层
+    freeze_layers     : 冻结前 N 层 encoder（从第0层开始）
+    """
+    frozen_params = 0
+
+    if freeze_embeddings:
+        for p in model.bert.embeddings.parameters():
+            p.requires_grad = False
+            frozen_params += p.numel()
+        print(f"  已冻结 embedding 层")
+
+    for i in range(freeze_layers):
+        for p in model.bert.encoder.layer[i].parameters():
+            p.requires_grad = False
+            frozen_params += p.numel()
+        print(f"  已冻结 encoder layer {i}")
+
+    trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    total     = sum(p.numel() for p in model.parameters())
+    print(f"  冻结参数：{frozen_params/1e6:.1f}M，"
+          f"可训练参数：{trainable/1e6:.1f}M / 总参数：{total/1e6:.1f}M")
+
+
+def make_layerwise_optimizer(model, base_lr, weight_decay,
+                              frozen_layers=3, top_lr_multiplier=2.0):
+    """
+    分层学习率：底层（未冻结的中间层）用 base_lr，
+    顶层 encoder + QA head 用 base_lr * top_lr_multiplier。
+    冻结层不加入 optimizer。
+    """
+    num_layers = model.bert.config.num_hidden_layers  # 6
+
+    # 按层分组
+    mid_params, top_params = [], []
+    for i in range(frozen_layers, num_layers):
+        layer_params = list(model.bert.encoder.layer[i].parameters())
+        if i < num_layers - 2:
+            mid_params.extend(layer_params)   # 中间未冻结层
+        else:
+            top_params.extend(layer_params)   # 最顶部2层 + QA head
+
+    # pooler 和 QA head 用高学习率
+    top_params.extend(list(model.qa_outputs.parameters()))
+
+    param_groups = [
+        {"params": mid_params, "lr": base_lr,                       "weight_decay": weight_decay},
+        {"params": top_params, "lr": base_lr * top_lr_multiplier,   "weight_decay": weight_decay},
+    ]
+    # 过滤掉空组
+    param_groups = [g for g in param_groups if len(g["params"]) > 0]
+    return torch.optim.AdamW(param_groups)
+
+
+# ============================================================
 # 数据预处理（训练集）
+# ============================================================
+
 def preprocess_train(examples, tokenizer):
     questions = [q.strip() for q in examples["question"]]
     contexts = examples["context"]
@@ -611,8 +671,8 @@ def run_experiment_E():
         print("\n>>> 第一阶段：预训练蒸馏")
         run_pretrain_distill()
 
-    # ---- 第二阶段：微调蒸馏（与 D 组相同损失，但学生初始化不同）----
-    print("\n>>> 第二阶段：微调阶段蒸馏（Logits + QA-Attention）")
+    # ---- 第二阶段：微调蒸馏（与 D 组相同损失，但学生初始化 + 冻结策略不同）----
+    print("\n>>> 第二阶段：微调阶段蒸馏（Logits + QA-Attention + 底层冻结）")
 
     device = get_device()
     tokenizer = AutoTokenizer.from_pretrained(TEACHER_SAVE_PATH)
@@ -620,12 +680,29 @@ def run_experiment_E():
 
     teacher = load_finetuned_teacher(device)
 
-    # ✅ 关键区别：从预训练蒸馏权重初始化，而非直接从微调教师偶数层
+    #  关键区别：从预训练蒸馏权重初始化，而非直接从微调教师偶数层
     student = build_student_model_from_teacher(device, init_mode="pretrain_distill")
 
-    optimizer, scheduler = make_optimizer_scheduler(
-        student, train_loader, STUDENT_LR, STUDENT_WARMUP_RATIO, STUDENT_WEIGHT_DECAY, STUDENT_EPOCHS
+    #  冻结底层，保留预训练蒸馏习得的表征
+    print(f"冻结策略：embeddings={FREEZE_EMBEDDINGS}，底部 {FREEZE_BOTTOM_LAYERS} 层")
+    freeze_bottom_layers(
+        student,
+        freeze_embeddings=FREEZE_EMBEDDINGS,
+        freeze_layers=FREEZE_BOTTOM_LAYERS,
     )
+
+    #  分层学习率：未冻结的中间层用 base_lr，顶层 + QA head 用 2x lr
+    optimizer = make_layerwise_optimizer(
+        student,
+        base_lr=STUDENT_LR,
+        weight_decay=STUDENT_WEIGHT_DECAY,
+        frozen_layers=FREEZE_BOTTOM_LAYERS,
+        top_lr_multiplier=2.0,
+    )
+    total_steps = len(train_loader) * STUDENT_EPOCHS
+    warmup_steps = int(total_steps * STUDENT_WARMUP_RATIO)
+    from transformers import get_linear_schedule_with_warmup
+    scheduler = get_linear_schedule_with_warmup(optimizer, warmup_steps, total_steps)
 
     save_path = EXPERIMENT_PATHS["E"]
     best_val_loss = float("inf")
@@ -708,7 +785,6 @@ EXPERIMENT_RUNNERS = {
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    parser.add_argument("--auto_shutdown", action="store_true", help="训练结束自动关机")
     parser.add_argument("--exp", type=str, default="all",
                         help="要运行的实验组：all / A / B / C / D / E / A,B,C 等")
     parser.add_argument("--report_only", action="store_true",
@@ -717,8 +793,6 @@ if __name__ == "__main__":
 
     if args.report_only:
         run_evaluation()
-    elif args.auto_shutdown:
-        pass
     else:
         if args.exp == "all":
             exp_list = ["A", "B", "C", "D", "E"]
@@ -736,4 +810,5 @@ if __name__ == "__main__":
             EXPERIMENT_RUNNERS[exp_id]()
 
         run_evaluation(exp_list)
+
     os.system("/usr/bin/shutdown")

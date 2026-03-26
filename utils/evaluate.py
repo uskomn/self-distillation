@@ -20,12 +20,7 @@ from tqdm import tqdm
 from config import MAX_LENGTH, DOC_STRIDE, MAX_ANSWER_LENGTH
 
 
-# ============================================================
-# EM / F1 计算（参考 SQuAD 官方评估脚本，适配中文）
-# ============================================================
-
 def normalize_answer(s):
-    """中文答案归一化：去除标点、空格"""
     def remove_punc(text):
         exclude = set(string.punctuation + "，。？！；：""''【】《》、")
         return "".join(ch for ch in text if ch not in exclude)
@@ -39,11 +34,11 @@ def normalize_answer(s):
 def get_tokens(s):
     return list(normalize_answer(s))  # 中文按字符分
 
-
+# em
 def compute_exact(pred, gold):
     return int(normalize_answer(pred) == normalize_answer(gold))
 
-
+# f1
 def compute_f1(pred, gold):
     pred_tokens = get_tokens(pred)
     gold_tokens = get_tokens(gold)
@@ -59,10 +54,7 @@ def compute_f1(pred, gold):
     return 2 * precision * recall / (precision + recall)
 
 
-# ============================================================
 # 模型大小
-# ============================================================
-
 def get_model_size_mb(model_path: str) -> float:
     """计算 checkpoint 目录下所有模型权重文件的总大小（MB）"""
     total_bytes = 0
@@ -83,10 +75,8 @@ def get_param_count(model) -> dict:
     }
 
 
-# ============================================================
-# 显存占用
-# ============================================================
 
+# 显存占用
 def get_gpu_memory_mb() -> float:
     """返回当前 GPU 已分配显存（MB）"""
     if torch.cuda.is_available():
@@ -101,10 +91,7 @@ def get_peak_gpu_memory_mb() -> float:
     return 0.0
 
 
-# ============================================================
 # 数据预处理（验证集，保留 offset_mapping 用于答案还原）
-# ============================================================
-
 def preprocess_validation(examples, tokenizer):
     questions = [q.strip() for q in examples["question"]]
     contexts = examples["context"]
@@ -141,7 +128,7 @@ def get_val_dataloader(tokenizer, batch_size=32):
         remove_columns=val_raw.column_names,
     )
 
-    # ✅ 在 set_format 之前，先把 postprocess 需要的元数据列单独保存
+    # 在 set_format 之前，先把 postprocess 需要的元数据列单独保存
     # set_format("torch") 只暴露 tensor 列，example_id / offset_mapping 会被隐藏
     val_meta = {
         "example_id":     val_tokenized["example_id"],       # list[str]
@@ -149,7 +136,7 @@ def get_val_dataloader(tokenizer, batch_size=32):
         "token_type_ids": val_tokenized["token_type_ids"],   # list[list[int]]，set_format 前提取
     }
 
-    # ✅ output_all_columns=True 让 DataLoader 只用 tensor 列，但 dataset 索引仍保留全部列
+    #  output_all_columns=True 让 DataLoader 只用 tensor 列，但 dataset 索引仍保留全部列
     val_tokenized.set_format(
         "torch",
         columns=["input_ids", "attention_mask", "token_type_ids"],
@@ -161,10 +148,7 @@ def get_val_dataloader(tokenizer, batch_size=32):
     return loader, val_raw, val_tokenized, val_meta
 
 
-# ============================================================
 # 答案还原（从 logits -> 文本答案）
-# ============================================================
-
 def postprocess_predictions(val_raw, val_meta, all_start_logits, all_end_logits):
     """
     将 start/end logits 还原为文本答案
@@ -175,7 +159,7 @@ def postprocess_predictions(val_raw, val_meta, all_start_logits, all_end_logits)
     """
     features_per_example = collections.defaultdict(list)
 
-    # ✅ 直接用 val_meta["example_id"]，不再遍历 val_tokenized
+    #  直接用 val_meta["example_id"]，不再遍历 val_tokenized
     for i, eid in enumerate(val_meta["example_id"]):
         features_per_example[eid].append(i)
 
@@ -192,11 +176,11 @@ def postprocess_predictions(val_raw, val_meta, all_start_logits, all_end_logits)
             start_logits = all_start_logits[feat_idx]
             end_logits = all_end_logits[feat_idx]
 
-            # ✅ 从 val_meta 取 offset_mapping，不依赖 torch format 下的 val_tokenized 索引
+            # 从 val_meta 取 offset_mapping，不依赖 torch format 下的 val_tokenized 索引
             offsets = val_meta["offset_mapping"][feat_idx]
 
-            # ✅ 用 token_type_ids 推断 context 边界
-            # ✅ 从 val_meta 取，不依赖外部 val_tokenized
+            # 用 token_type_ids 推断 context 边界
+            # 从 val_meta 取，不依赖外部 val_tokenized
             token_type_ids_i = val_meta["token_type_ids"][feat_idx]
             context_start = next(
                 (i for i, t in enumerate(token_type_ids_i) if t == 1), None
@@ -224,26 +208,18 @@ def postprocess_predictions(val_raw, val_meta, all_start_logits, all_end_logits)
     return predictions
 
 
-# ============================================================
 # 核心评估函数
-# ============================================================
-
 def evaluate_model(
         model_path: str,
         experiment_name: str,
         batch_size: int = 32,
         device=None
 ) -> dict:
-    """
-    对一个 checkpoint 进行完整评估，返回所有指标
-    """
     if device is None:
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-    print(f"\n{'='*60}")
     print(f"评估实验：{experiment_name}")
     print(f"模型路径：{model_path}")
-    print(f"{'='*60}")
 
     # ------ 加载模型 ------
     tokenizer = AutoTokenizer.from_pretrained(model_path)
@@ -354,7 +330,7 @@ def evaluate_model(
         "inference_gpu_mb": round(inference_gpu_mb, 1),
     }
 
-    print(f"\n📊 {experiment_name} 评估结果：")
+    print(f"\n {experiment_name} 评估结果：")
     print(f"  EM:             {avg_em:.2f}%")
     print(f"  F1:             {avg_f1:.2f}%")
     print(f"  平均延迟:       {avg_latency_ms:.3f} ms/sample")

@@ -403,7 +403,7 @@ def train_student():
             os.makedirs(STUDENT_SAVE_PATH, exist_ok=True)
             student_model.save_pretrained(STUDENT_SAVE_PATH)
             tokenizer.save_pretrained(STUDENT_SAVE_PATH)
-            print(f"  ✅ 保存最优学生模型，Val Loss: {avg_val_loss:.4f}")
+            print(f"  保存最优学生模型，Val Loss: {avg_val_loss:.4f}")
 
     print(f"\n学生模型蒸馏完成，最优验证损失：{best_val_loss:.4f}")
     print(f"模型已保存至：{STUDENT_SAVE_PATH}")
