@@ -105,7 +105,7 @@ def make_layerwise_optimizer(model, base_lr, weight_decay,
         else:
             top_params.extend(layer_params)   # 最顶部2层 + QA head
 
-    # pooler 和 QA head 用高学习率
+    # QA head 用高学习率（BertForQuestionAnswering 无 pooler）
     top_params.extend(list(model.qa_outputs.parameters()))
 
     param_groups = [
@@ -683,26 +683,10 @@ def run_experiment_E():
     #  关键区别：从预训练蒸馏权重初始化，而非直接从微调教师偶数层
     student = build_student_model_from_teacher(device, init_mode="pretrain_distill")
 
-    #  冻结底层，保留预训练蒸馏习得的表征
-    print(f"冻结策略：embeddings={FREEZE_EMBEDDINGS}，底部 {FREEZE_BOTTOM_LAYERS} 层")
-    freeze_bottom_layers(
-        student,
-        freeze_embeddings=FREEZE_EMBEDDINGS,
-        freeze_layers=FREEZE_BOTTOM_LAYERS,
+    # 任务感知预训练后不再需要冻结底层，全参数微调即可
+    optimizer, scheduler = make_optimizer_scheduler(
+        student, train_loader, STUDENT_LR, STUDENT_WARMUP_RATIO, STUDENT_WEIGHT_DECAY, STUDENT_EPOCHS
     )
-
-    #  分层学习率：未冻结的中间层用 base_lr，顶层 + QA head 用 2x lr
-    optimizer = make_layerwise_optimizer(
-        student,
-        base_lr=STUDENT_LR,
-        weight_decay=STUDENT_WEIGHT_DECAY,
-        frozen_layers=FREEZE_BOTTOM_LAYERS,
-        top_lr_multiplier=2.0,
-    )
-    total_steps = len(train_loader) * STUDENT_EPOCHS
-    warmup_steps = int(total_steps * STUDENT_WARMUP_RATIO)
-    from transformers import get_linear_schedule_with_warmup
-    scheduler = get_linear_schedule_with_warmup(optimizer, warmup_steps, total_steps)
 
     save_path = EXPERIMENT_PATHS["E"]
     best_val_loss = float("inf")

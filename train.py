@@ -1,4 +1,4 @@
-# 服务器代码项目文件位置/tmp/pycharm_projects_852
+# 服务器代码项目文件位置/tmp/pycharm_project_852
 import os
 import argparse
 import torch

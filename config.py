@@ -73,3 +73,15 @@ PRETRAIN_MLM_PROB = 0.15            # MLM 掩码比例
 PT_LAMBDA_MLM = 1.0                 # 学生 MLM 任务损失（学生自身学习）
 PT_LAMBDA_HIDDEN = 0.1              # 隐层 MSE 蒸馏
 PT_LAMBDA_ATTN = 0.1                # Attention MSE 蒸馏
+# ====== 任务感知预训练蒸馏（Task-Aware Pretraining Distillation）======
+# 在预训练阶段混入少量 CMRC2018 QA 数据，让学生提前建立任务意识
+# QA 批次与 Wikipedia 批次交替出现，比例由 PT_QA_INTERLEAVE_EVERY 控制
+PT_QA_INTERLEAVE_EVERY = 4  # 每 N 个 Wikipedia batch 插入 1 个 QA batch
+# 即 QA 数据占比约 1/(N+1) ≈ 20%
+
+PT_LAMBDA_QA_HARD = 0.5  # QA hard label 损失权重（CE loss）
+PT_LAMBDA_QA_KD = 0.3  # QA logits 蒸馏权重（KD loss，需要微调教师）
+
+# 任务感知蒸馏需要微调教师提供 QA logits
+# 若教师 checkpoint 不存在则只用 hard label，不做 QA logits 蒸馏
+PT_USE_QA_KD = True  # 是否使用 QA logits 蒸馏（需要教师已微调）
