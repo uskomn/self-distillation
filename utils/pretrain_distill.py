@@ -598,7 +598,7 @@ def run_pretrain_distill():
             os.makedirs(PRETRAIN_STUDENT_SAVE_PATH, exist_ok=True)
             student.save_pretrained(PRETRAIN_STUDENT_SAVE_PATH)
             tokenizer.save_pretrained(PRETRAIN_STUDENT_SAVE_PATH)
-            print(f"  ✅ 保存最优权重 Loss:{avg_total:.4f} -> {PRETRAIN_STUDENT_SAVE_PATH}")
+            print(f" 保存最优权重 Loss:{avg_total:.4f} -> {PRETRAIN_STUDENT_SAVE_PATH}")
 
     print(f"\n任务感知预训练蒸馏完成，最优 Loss: {best_loss:.4f}")
     print("注：qa_head 为预训练阶段临时模块，微调阶段将使用 BertForQuestionAnswering 的 qa_outputs 替代")
