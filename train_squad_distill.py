@@ -21,15 +21,15 @@ import torch.nn.functional as F
 from torch.utils.data import DataLoader
 from transformers import (
     AutoTokenizer,
-    AutoModelForQuestionAnswering,
     get_linear_schedule_with_warmup,
 )
-from datasets import load_from_disk
+from datasets import load_dataset,load_from_disk
 from tqdm import tqdm
 
 from config_squad import (
     TEACHER_NAME, TEACHER_PRETRAIN_NAME, STUDENT_BASE,
     TEACHER_SAVE_PATH, STUDENT_SAVE_PATH,
+    PT_STUDENT_SAVE_PATH,DATASET_NAME,
     DATASET_NAME, MAX_LENGTH, DOC_STRIDE, MAX_ANSWER_LENGTH,
     STUDENT_NUM_LAYERS, TEACHER_LAYERS_FOR_DISTILL,
     TEACHER_EPOCHS, TEACHER_BATCH_SIZE, TEACHER_LR,
@@ -38,8 +38,12 @@ from config_squad import (
     ALPHA, BETA, GAMMA, TEMPERATURE,
 )
 from models.models_squad import TeacherModel, StudentModel
-from utils.evaluate import evaluate_model
+from utils.pretrain_distill_squad import run_pretrain_distill  # 任务感知预训练蒸馏
 
+
+# ============================================================
+# 数据预处理
+# ============================================================
 
 def preprocess_train(examples, tokenizer):
     """SQuAD 训练集预处理：滑窗分割，标注答案 token 位置"""
@@ -149,6 +153,10 @@ def get_dataloaders(tokenizer):
     return train_loader, val_loader, val_raw, val_meta
 
 
+# ============================================================
+# 蒸馏损失
+# ============================================================
+
 def hard_label_loss(student_start, student_end, start_pos, end_pos):
     ce = nn.CrossEntropyLoss()
     return ce(student_start, start_pos) + ce(student_end, end_pos)
@@ -205,8 +213,14 @@ def qa_focused_attention_loss(student_attns, teacher_attns,
         H_s = s_a.size(1)
         H_t = t_a.size(1)
         if H_t != H_s:
-            t_a = t_a.mean(dim=1, keepdim=True)  # (B, 1, L, L)
-            t_a = t_a.expand(-1, H_s, -1, -1)  # (B, H_s, L, L)
+            # adaptive_avg_pool1d 对最后一维操作，需要先转置让 H_t 在最后
+            # (B, H_t, L, L) -> (B, L*L, H_t) -> pool -> (B, L*L, H_s) -> (B, H_s, L, L)
+            B, _, L, _ = t_a.shape
+            t_a = t_a.view(B, H_t, L * L)  # (B, H_t, L*L)
+            t_a = t_a.permute(0, 2, 1).contiguous()  # (B, L*L, H_t)  ← H_t 移到最后
+            t_a = F.adaptive_avg_pool1d(t_a, H_s)  # (B, L*L, H_s)  ← 对 H_t 做池化
+            t_a = t_a.permute(0, 2, 1).contiguous()  # (B, H_s, L*L)
+            t_a = t_a.view(B, H_s, L, L)  # (B, H_s, L, L)
 
         s_norm = torch.sqrt(s_a + 1e-6)
         t_norm = torch.sqrt(t_a + 1e-6)
@@ -230,6 +244,8 @@ def distillation_loss(student_out, teacher_out, start_pos, end_pos,
     )
     total = ALPHA * l_hard + BETA * l_logits + GAMMA * l_attn
     return total, l_hard, l_logits, l_attn
+
+
 # ============================================================
 # EM / F1 评估（SQuAD 官方逻辑）
 # ============================================================
@@ -511,7 +527,7 @@ def train_teacher():
             os.makedirs(TEACHER_SAVE_PATH, exist_ok=True)
             model.save_pretrained(TEACHER_SAVE_PATH)
             tokenizer.save_pretrained(TEACHER_SAVE_PATH)
-            print(f"   保存教师最优模型，F1: {best_f1:.2f}%")
+            print(f"  ✅ 保存教师最优模型，F1: {best_f1:.2f}%")
 
     print(f"\n教师微调完成，最优 F1: {best_f1:.2f}%")
     print(f"Checkpoint 已保存至：{TEACHER_SAVE_PATH}")
@@ -522,7 +538,7 @@ def train_teacher():
 # 训练主流程
 # ============================================================
 
-def train():
+def train(student_init_mode: str = "bert_base"):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"设备：{device}")
     if torch.cuda.is_available():
@@ -535,8 +551,8 @@ def train():
     teacher = TeacherModel(load_finetuned=True).to(device)
     teacher.eval()
 
-    # 学生
-    student_wrapper = StudentModel()
+    # 学生（init_mode 由调用方传入）
+    student_wrapper = StudentModel(init_mode=student_init_mode)
     student = student_wrapper.model.to(device)
 
     optimizer = torch.optim.AdamW(student.parameters(), lr=LR, weight_decay=WEIGHT_DECAY)
@@ -617,7 +633,7 @@ def train():
             os.makedirs(STUDENT_SAVE_PATH, exist_ok=True)
             student.save_pretrained(STUDENT_SAVE_PATH)
             tokenizer.save_pretrained(STUDENT_SAVE_PATH)
-            print(f"   保存最优模型，F1: {best_f1:.2f}%")
+            print(f"  ✅ 保存最优模型，F1: {best_f1:.2f}%")
 
     print(f"\n训练完成，最优 F1: {best_f1:.2f}%")
     return best_f1
@@ -627,27 +643,16 @@ def train():
 # 最终评估报告（教师 vs 学生对比）
 # ============================================================
 
-def load_finetuned_teacher(device):
-    """加载已微调好的教师模型（推理模式）"""
-    from transformers import AutoConfig
-    config = AutoConfig.from_pretrained(TEACHER_SAVE_PATH)
-    config.output_attentions = True
-    config.output_hidden_states = True
-    teacher = AutoModelForQuestionAnswering.from_pretrained(TEACHER_SAVE_PATH, config=config)
-    teacher.eval()
-    return teacher.to(device)
-
 def final_report():
     device    = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    tokenizer = AutoTokenizer.from_pretrained(TEACHER_SAVE_PATH)
+    tokenizer = AutoTokenizer.from_pretrained(TEACHER_NAME)
     _, val_loader, val_raw, val_meta = get_dataloaders(tokenizer)
 
     results = []
 
     # 教师评估
     print("\n评估教师模型...")
-    from transformers import AutoModelForQuestionAnswering
-    teacher = AutoModelForQuestionAnswering.from_pretrained(TEACHER_SAVE_PATH).to(device)
+    teacher = TeacherModel(load_finetuned=True).to(device)
     t_metrics = evaluate(teacher, val_loader, val_raw, val_meta, device, desc="教师推理")
     t_info    = get_model_info(teacher)
     results.append({
@@ -719,55 +724,6 @@ def final_report():
         json.dump(results, f, ensure_ascii=False, indent=2)
     print("结果已保存至 ./results_squad/report.json")
 
-def print_comparison_table(results):
-    """打印对比表格"""
-    print("\n" + "="*90)
-    print("实验对比报告")
-    print("="*90)
-
-    header = (
-        f"{'实验':<28} {'EM%':>7} {'F1%':>7} "
-        f"{'延迟(ms)':>10} {'P99(ms)':>9} "
-        f"{'大小(MB)':>9} {'参数(M)':>8} "
-        f"{'显存(MB)':>9}"
-    )
-    print(header)
-    print("-"*90)
-
-    for r in results:
-        line = (
-            f"{r['experiment']:<28} "
-            f"{r['EM']:>7.2f} {r['F1']:>7.2f} "
-            f"{r['avg_latency_ms']:>10.3f} {r['p99_latency_ms']:>9.3f} "
-            f"{r['model_size_mb']:>9.1f} {r['param_count_M']:>8.1f} "
-            f"{r['inference_gpu_mb']:>9.1f}"
-        )
-        print(line)
-
-    print("="*90)
-
-    # 相对于 A 组（教师 Baseline）计算压缩率和性能保留率
-    baseline = next((r for r in results if "A组" in r["experiment"]), None)
-    if baseline and len(results) > 1:
-        print("\n相对教师 Baseline 的对比（学生模型各组）：")
-        print(f"{'实验':<28} {'F1保留率':>10} {'大小压缩':>10} {'速度提升':>10} {'显存减少':>10}")
-        print("-"*65)
-        for r in results:
-            if "A组" in r["experiment"]:
-                continue
-            f1_retention = r["F1"] / baseline["F1"] * 100 if baseline["F1"] > 0 else 0
-            size_ratio = baseline["model_size_mb"] / r["model_size_mb"] if r["model_size_mb"] > 0 else 0
-            speed_ratio = baseline["avg_latency_ms"] / r["avg_latency_ms"] if r["avg_latency_ms"] > 0 else 0
-            mem_reduction = (1 - r["inference_gpu_mb"] / baseline["inference_gpu_mb"]) * 100 if baseline["inference_gpu_mb"] > 0 else 0
-            print(
-                f"{r['experiment']:<28} "
-                f"{f1_retention:>9.1f}% "
-                f"{size_ratio:>9.1f}x "
-                f"{speed_ratio:>9.1f}x "
-                f"{mem_reduction:>9.1f}%"
-            )
-        print("="*65)
-
 
 # ============================================================
 # 主入口
@@ -775,12 +731,19 @@ def print_comparison_table(results):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    parser.add_argument("--eval_only",          action="store_true",
+    parser.add_argument("--eval_only",           action="store_true",
                         help="只做最终评估报告，不训练")
-    parser.add_argument("--skip_teacher_train", action="store_true",
+    parser.add_argument("--skip_teacher_train",  action="store_true",
                         help="跳过教师微调（已有 checkpoint 时使用）")
-    parser.add_argument("--teacher_only",       action="store_true",
-                        help="只微调教师，不做学生蒸馏")
+    parser.add_argument("--skip_pretrain_distill", action="store_true",
+                        help="跳过预训练蒸馏（已有权重时使用）")
+    parser.add_argument("--teacher_only",        action="store_true",
+                        help="只微调教师")
+    parser.add_argument("--pretrain_only",       action="store_true",
+                        help="只做预训练蒸馏")
+    parser.add_argument("--two_stage",           action="store_true",
+                        help="两阶段蒸馏：预训练蒸馏 + 微调蒸馏（推荐）")
+    parser.add_argument("--exit", action="store_true",help="查看文件是否存在")
     args = parser.parse_args()
 
     if args.eval_only:
@@ -788,15 +751,48 @@ if __name__ == "__main__":
 
     elif args.teacher_only:
         train_teacher()
-    else:
-        # Step1：教师微调（若已有 checkpoint 则跳过）
-        if args.skip_teacher_train and os.path.exists(TEACHER_SAVE_PATH):
-            print(f"检测到教师 checkpoint：{TEACHER_SAVE_PATH}，跳过微调")
+
+    elif args.pretrain_only:
+        run_pretrain_distill()
+
+    elif args.two_stage:
+        # ====== 两阶段蒸馏完整流程 ======
+        # Step 1：教师微调（bert-large-uncased 在 SQuAD 上微调）
+        if os.path.exists(TEACHER_SAVE_PATH):
+            print(f"跳过教师微调，使用已有 checkpoint：{TEACHER_SAVE_PATH}")
         else:
             train_teacher()
 
-        # Step2：学生蒸馏
-        train()
+        # Step 2：任务感知预训练蒸馏（英文 Wikipedia + SQuAD QA 混合）
+        if os.path.exists(PT_STUDENT_SAVE_PATH):
+            print(f"跳过预训练蒸馏，使用已有权重：{PT_STUDENT_SAVE_PATH}")
+        else:
+            run_pretrain_distill()
 
-        # Step3：最终评估报告
+        # Step 3：微调阶段蒸馏（学生从预训练蒸馏权重初始化，Logits + QA-Attention）
+        print("\n>>> 微调阶段蒸馏（学生从预训练蒸馏权重初始化）")
+        train(student_init_mode="pretrain_distill")
+
+        # Step 4：评估报告
         final_report()
+
+    elif args.exit:
+        if os.path.exists(PT_STUDENT_SAVE_PATH):
+            print("存在")
+        else:
+            print("不存在")
+    else:
+        # ====== 单阶段蒸馏（默认）======
+        # Step 1：教师微调
+        if args.skip_teacher_train and os.path.exists(TEACHER_SAVE_PATH):
+            print(f"跳过教师微调，使用已有 checkpoint：{TEACHER_SAVE_PATH}")
+        else:
+            train_teacher()
+
+        # Step 2：微调阶段蒸馏（从 bert-base 初始化）
+        train(student_init_mode="bert_base")
+
+        # Step 3：评估报告
+        final_report()
+
+    os.system("/usr/bin/shutdown")

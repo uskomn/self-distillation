@@ -177,12 +177,16 @@ def evaluate_squad(model_wrapper, val_loader, val_raw, val_meta, device):
 # ============================================================
 
 def finetune_distill(student_init_mode, save_path, device,
-                     train_loader, val_loader, val_raw, val_meta, tokenizer):
-    """微调阶段蒸馏训练，所有消融组共用，只有 student_init_mode 不同"""
+                     train_loader, val_loader, val_raw, val_meta, tokenizer,
+                     pretrain_path=None):
+    """
+    微调阶段蒸馏训练，所有消融组共用
+    pretrain_path：预训练蒸馏权重路径，None 时使用 config 默认路径
+    """
     teacher = TeacherModel(load_finetuned=True).to(device)
     teacher.eval()
 
-    student_wrapper = StudentModel(init_mode=student_init_mode)
+    student_wrapper = StudentModel(init_mode=student_init_mode, pretrain_path=pretrain_path)
     student = student_wrapper.model.to(device)
 
     optimizer = torch.optim.AdamW(
@@ -350,13 +354,13 @@ def run_pt_ablation_loss(exp_id, device, tokenizer):
     cfg      = loss_configs[exp_id]
     save_path = os.path.join(ABLATION_SAVE_DIR, f"pt_{exp_id.lower()}")
 
-    # B1 直接复用 PT-Dual 的权重（完整损失已跑过）
+    # B1 直接复用 PT-Dual 的权重（完整损失配置，已在主实验跑过）
     if exp_id == "B1":
         if os.path.exists(PT_STUDENT_SAVE_PATH):
             print(f"B1-Full 复用 PT-Dual 权重：{PT_STUDENT_SAVE_PATH}")
             PT_PATHS["B1"] = PT_STUDENT_SAVE_PATH
-            return
-        # 若 PT-Dual 未跑，则重新跑
+            return   # 路径已更新，直接返回，finetune 阶段会用 PT_PATHS["B1"]
+        # PT-Dual 未跑则重新跑，保存到 PT_STUDENT_SAVE_PATH
         save_path = PT_STUDENT_SAVE_PATH
 
     if os.path.exists(save_path):
@@ -476,39 +480,40 @@ def run_experiment(exp_id, device, train_loader, val_loader, val_raw, val_meta, 
     print(f"实验组：{EXP_NAMES[exp_id]}")
     print(f"{'='*60}")
 
-    # ------ 预训练阶段 ------
+    # ------ 确定预训练初始化方式和权重路径 ------
+    student_init  = "bert_base"   # A1 默认
+    pretrain_path = None
+
     if exp_id == "A1":
-        # 无预训练蒸馏，直接用 bert_base 初始化
-        student_init = "bert_base"
+        # 无预训练蒸馏，直接用 bert_base 初始化，无需路径
+        student_init  = "bert_base"
+        pretrain_path = None
 
     elif exp_id == "A2":
+        # 先跑单教师预训练蒸馏，保存到 PT_PATHS["A2"]
         run_pt_single(device, tokenizer)
-        # A2 的预训练权重已保存到 PT_PATHS["A2"]
-        # 需要把它加载到 models_squad.StudentModel._init_from_pretrain_distill
-        # 临时修改 PT_STUDENT_SAVE_PATH 指向 A2 路径
-        import config_squad as cfg_mod
-        _orig = cfg_mod.PT_STUDENT_SAVE_PATH
-        cfg_mod.PT_STUDENT_SAVE_PATH = PT_PATHS["A2"]
-        student_init = "pretrain_distill"
+        student_init  = "pretrain_distill"
+        pretrain_path = PT_PATHS["A2"]   #  显式传入 A2 专属路径
 
     elif exp_id == "A3":
-        # PT-Dual 权重由主实验已跑，直接用
+        # 复用主实验的 PT-Dual 权重
         if not os.path.exists(PT_STUDENT_SAVE_PATH):
             print(f"未找到 PT-Dual 权重：{PT_STUDENT_SAVE_PATH}")
             print("请先运行：python pretrain_distill_squad.py")
             return None
-        student_init = "pretrain_distill"
+        student_init  = "pretrain_distill"
+        pretrain_path = PT_STUDENT_SAVE_PATH
 
     elif exp_id in ("B1", "B2", "B3", "B4"):
+        # 损失消融：先跑对应消融配置的预训练蒸馏
         run_pt_ablation_loss(exp_id, device, tokenizer)
-        # 临时切换 PT_STUDENT_SAVE_PATH 到对应消融路径
-        import config_squad as cfg_mod
-        _orig = cfg_mod.PT_STUDENT_SAVE_PATH
-        cfg_mod.PT_STUDENT_SAVE_PATH = PT_PATHS[exp_id]
-        student_init = "pretrain_distill"
+        student_init  = "pretrain_distill"
+        pretrain_path = PT_PATHS[exp_id]  # 每组用自己的预训练权重
 
     # ------ 微调蒸馏阶段 ------
     save_path = FT_PATHS[exp_id]
+    print(exp_id)
+    print(pretrain_path)
     metrics   = finetune_distill(
         student_init_mode=student_init,
         save_path=save_path,
@@ -518,12 +523,8 @@ def run_experiment(exp_id, device, train_loader, val_loader, val_raw, val_meta, 
         val_raw=val_raw,
         val_meta=val_meta,
         tokenizer=tokenizer,
+        pretrain_path=pretrain_path,     # 显式传入，不再修改全局变量
     )
-
-    # 恢复原始 PT_STUDENT_SAVE_PATH（如果改过）
-    if exp_id in ("A2", "B1", "B2", "B3", "B4"):
-        import config_squad as cfg_mod
-        cfg_mod.PT_STUDENT_SAVE_PATH = _orig
 
     print(f" {EXP_NAMES[exp_id]} 完成 | EM:{metrics['EM']:.2f}% F1:{metrics['F1']:.2f}%")
     return metrics
